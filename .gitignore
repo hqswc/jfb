@@ -1,0 +1,18 @@
+# 构建中间产物
+build/classes/
+build/dex/
+build/app-unsigned.apk
+build/app-with-dex.apk
+build/app-aligned.apk
+build/*.idsig
+
+# 签名密钥（绝不提交！）
+*.jks
+*.keystore
+keystore-private/
+build/keystore.jks
+
+# 临时
+_tmp/
+*.log
+.DS_Store
