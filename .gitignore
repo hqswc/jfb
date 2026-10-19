@@ -16,3 +16,6 @@ build/keystore.jks
 _tmp/
 *.log
 .DS_Store
+
+# 构建输出目录（正式包放 release/）
+build/
