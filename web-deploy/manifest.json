@@ -1,0 +1,26 @@
+{
+  "name": "记分板 · 管理端",
+  "short_name": "记分板管理",
+  "description": "管理队伍分数、记录、抽签、导出数据",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#e9edf6",
+  "theme_color": "#e9edf6",
+  "lang": "zh-CN",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}
