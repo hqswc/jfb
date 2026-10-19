@@ -28,6 +28,10 @@ build.sh            一键构建脚本
 keystore-private/   签名密钥（不纳入版本库）
 ```
 
+## 仓库
+
+<https://github.com/hqswc/jfb>
+
 ## 构建
 
 需要 Android SDK 工具链（`aapt`、`javac`、`d8`、`zipalign`、`apksigner`）与 `android.jar`：
