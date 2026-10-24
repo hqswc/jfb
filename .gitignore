@@ -19,3 +19,7 @@ _tmp/
 
 # 构建输出目录（正式包放 release/）
 build/
+
+# 发布包不入库（体积大，用 GitHub Releases 分发）
+release/*.apk
+release/*.zip

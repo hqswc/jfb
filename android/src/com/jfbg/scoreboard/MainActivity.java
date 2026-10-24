@@ -27,6 +27,9 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Toast;
 
+import org.json.JSONException;
+import org.json.JSONObject;
+
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -34,50 +37,44 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 
 /**
- * 记分板 · 安卓外壳
+ * 记分板 · 独立安卓 App（不依赖任何网站）
  *
- * 设计要点：
- * 1) 页面固定在虚拟安全源 https://appassets.androidplatform.net 下运行，
- *    这样 localStorage / crypto.randomUUID / 安全上下文都正常，且离线可用。
- * 2) 混合更新：启动时若联网，则从 https://jfbgv1.cn 拉取最新 index.html；
- *    拉取失败（断网/超时/内容异常）则回退到内置 assets/www 离线包。
- *    —— 这样你在 Cloudflare 上改完网页，App 不用重装就能生效；断网也照常打开。
- * 3) 补上 WebView 没有的能力：xlsx 导出写入「下载/记分板导出」、返回键导航、状态栏配色。
+ * 架构：
+ *   界面 = 打包在 APK 里的 HTML（assets/www），运行在虚拟安全源
+ *           https://appassets.androidplatform.net 上
+ *   数据 = 本机 SQLite（ScoreStore），完全离线，不访问网络
+ *   导出 = 原生写入「下载/记分板导出」
+ *
+ * 相比之前的联网版：
+ *   - 删除了「启动时从 jfbgv1.cn 拉取最新页面」的逻辑 → 不再依赖网站
+ *   - 删除 INTERNET 权限依赖的实际使用（保留权限仅为兼容旧清单）
+ *   - 页面里所有 fetch(Supabase) 改成本地 AndroidBridge 调用
  */
 public class MainActivity extends Activity {
 
     private static final String TAG = "ScoreboardApp";
 
-    /** 虚拟安全域名（Android WebView 官方约定的本地源） */
+    private static final String XLSX_MIME =
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
+    /** 虚拟安全域名：安全上下文（localStorage / crypto.randomUUID 可用），且不需要网络 */
     private static final String APP_HOST = "appassets.androidplatform.net";
     private static final String START_URL = "https://" + APP_HOST + "/index.html";
 
-    /** 线上站点：App 启动时尝试拉取最新页面 */
-    private static final String REMOTE_BASE = "https://jfbgv1.cn";
-    private static final boolean REMOTE_FIRST = true;
-    private static final int CONNECT_TIMEOUT_MS = 2500;
-    private static final int READ_TIMEOUT_MS = 4000;
-
     private WebView webView;
+    private ScoreStore store;
     private long lastBackPress = 0L;
     private Uri lastSavedUri = null;
     private String lastSavedMime = null;
     private String lastSavedPath = null;
 
-    /** 诊断开关（仅 adb / am 附加参数可触发，普通用户不会遇到） */
     private boolean diagnostics = false;
-    private boolean forceOffline = false;
-
-    private volatile String remoteHtml = null;   // 本次进程内缓存线上页面
-    private volatile boolean remoteTried = false;
 
     private static final Map<String, String> MIME = new HashMap<>();
     static {
@@ -96,9 +93,10 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        Intent it = getIntent();
-        diagnostics = it != null && it.getBooleanExtra("selftest", false);
-        forceOffline = it != null && it.getBooleanExtra("forceoffline", false);
+        diagnostics = getIntent() != null && getIntent().getBooleanExtra("selftest", false);
+
+        store = new ScoreStore(this);
+        store.ensureSeeded();
 
         applySystemBars();
 
@@ -116,15 +114,19 @@ public class MainActivity extends Activity {
         s.setBuiltInZoomControls(false);
         s.setDisplayZoomControls(false);
         s.setMediaPlaybackRequiresUserGesture(true);
-        s.setTextZoom(100);                 // 不跟随系统字体缩放，版式与网页一致
-        s.setCacheMode(WebSettings.LOAD_DEFAULT);
+        s.setTextZoom(100);
+        // 完全本地：所有请求都由 shouldInterceptRequest 从 assets 返回，
+        // 非本机虚拟域名一律 403，因此不会有任何真实网络流量。
+        // 这里显式置 false —— 若置 true，部分 WebView 版本会把主文档也判为网络加载而白屏。
+        s.setBlockNetworkLoads(false);
+        s.setCacheMode(WebSettings.LOAD_NO_CACHE);
         s.setJavaScriptCanOpenWindowsAutomatically(false);
         s.setSupportMultipleWindows(false);
         if (Build.VERSION.SDK_INT >= 21) {
             s.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
         }
         if (Build.VERSION.SDK_INT >= 26) {
-            s.setSafeBrowsingEnabled(true);
+            s.setSafeBrowsingEnabled(false);   // 纯本地内容，无需安全浏览联网校验
         }
 
         webView.setWebChromeClient(new WebChromeClient() {
@@ -140,7 +142,6 @@ public class MainActivity extends Activity {
         webView.loadUrl(START_URL);
     }
 
-    /** 状态栏与网页底色一致（#e9edf6），深色图标 */
     private void applySystemBars() {
         Window w = getWindow();
         w.setStatusBarColor(Color.parseColor("#e9edf6"));
@@ -153,25 +154,22 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** appassets.androidplatform.net/** -> 线上最新页（联网时），否则内置离线包 */
+    /** 所有请求都从 assets 读取，永不联网 */
     private final class AssetClient extends WebViewClient {
         @Override
         public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
             Uri url = request.getUrl();
-            if (url == null || !APP_HOST.equals(url.getHost())) return null;
+            if (url == null || !APP_HOST.equals(url.getHost())) {
+                // 外部资源一律拦截为空（App 内不该出现任何外部请求）
+                return new WebResourceResponse("text/plain", "utf-8", 403, "Forbidden", null,
+                        new ByteArrayInputStream(new byte[0]));
+            }
             return serveAsset(url.getPath());
         }
 
         @Override
         public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-            Uri url = request.getUrl();
-            if (url == null) return false;
-            if (APP_HOST.equals(url.getHost())) return false;
-            try {
-                startActivity(new Intent(Intent.ACTION_VIEW, url));
-            } catch (Exception ignored) {
-            }
-            return true;
+            return true;   // 不跳转任何外部链接
         }
 
         @Override
@@ -183,13 +181,13 @@ public class MainActivity extends Activity {
                     public void run() {
                         runDiagnostics(view);
                     }
-                }, 8000L);
+                }, 3000L);
             }
         }
 
         @Override
         public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
-            Log.e(TAG, "load error " + request.getUrl() + " -> " + error.getDescription());
+            Log.e(TAG, "asset error " + request.getUrl() + " -> " + error.getDescription());
         }
     }
 
@@ -203,18 +201,6 @@ public class MainActivity extends Activity {
 
         Map<String, String> headers = new HashMap<>();
         headers.put("Cache-Control", "no-store");
-
-        // index.html：优先线上最新版（保持同一虚拟源，localStorage 不分裂）
-        if ("/index.html".equals(path) || "/".equals(path)) {
-            String html = obtainRemoteHtml();
-            if (html != null) {
-                Log.i(TAG, "SERVING remote https://jfbgv1.cn/index.html (" + html.length() + " chars)");
-                return new WebResourceResponse("text/html", "utf-8", 200, "OK", headers,
-                        new ByteArrayInputStream(html.getBytes(StandardCharsets.UTF_8)));
-            }
-            Log.i(TAG, "SERVING bundled offline copy");
-            return assetResponse("www/index.html", mime, headers);
-        }
         return assetResponse("www" + path, mime, headers);
     }
 
@@ -228,79 +214,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    /**
-     * 拉取线上页面并做两处改造（每次启动只拉一次）：
-     *  - 把 CDN 上的 SheetJS 换成本地内置副本（离线也能导出）
-     *  - 去掉 Service Worker 注册（App 内由原生层负责更新，避免缓存叠加）
-     */
-    private String obtainRemoteHtml() {
-        if (!REMOTE_FIRST || forceOffline) return null;
-        if (remoteTried) return remoteHtml;
-        synchronized (this) {
-            if (remoteTried) return remoteHtml;
-            remoteTried = true;
-            String raw = fetchRemote(REMOTE_BASE + "/index.html");
-            if (raw == null) {
-                Log.w(TAG, "remote fetch failed, fallback to bundled");
-                return null;
-            }
-            String html = transformHtml(raw);
-            // 基本健康检查：像我们自己的页面才用，避免线上误部署把 App 打挂
-            if (html.length() < 8000 || !html.contains("记分板")) {
-                Log.w(TAG, "remote html rejected by sanity check");
-                return null;
-            }
-            remoteHtml = html;
-            return html;
-        }
-    }
-
-    private String fetchRemote(String urlStr) {
-        HttpURLConnection conn = null;
-        try {
-            URL url = new URL(urlStr);
-            conn = (HttpURLConnection) url.openConnection();
-            conn.setConnectTimeout(CONNECT_TIMEOUT_MS);
-            conn.setReadTimeout(READ_TIMEOUT_MS);
-            conn.setInstanceFollowRedirects(true);
-            conn.setRequestProperty("User-Agent", "ScoreboardApp/1.0 (Android)");
-            conn.setRequestProperty("Accept", "text/html,*/*");
-            conn.setRequestProperty("Cache-Control", "no-cache");
-            int code = conn.getResponseCode();
-            if (code < 200 || code >= 300) {
-                Log.w(TAG, "remote http " + code);
-                return null;
-            }
-            InputStream in = conn.getInputStream();
-            ByteArrayOutputStream bos = new ByteArrayOutputStream();
-            byte[] buf = new byte[8192];
-            int n;
-            while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
-            in.close();
-            return new String(bos.toByteArray(), StandardCharsets.UTF_8);
-        } catch (Exception e) {
-            Log.w(TAG, "remote fetch error: " + e);
-            return null;
-        } finally {
-            if (conn != null) conn.disconnect();
-        }
-    }
-
-    private String transformHtml(String html) {
-        String out = html.replaceAll(
-                "<script src=\"https://cdn\\.sheetjs\\.com/[^\"]*\"></script>",
-                "<script src=\"xlsx.full.min.js\"></script>");
-        // 删除 Service Worker 注册块
-        int s = out.indexOf("if('serviceWorker' in navigator){");
-        if (s < 0) s = out.indexOf("if (\"serviceWorker\" in navigator)");
-        if (s >= 0) {
-            int e = out.indexOf("</script>", s);
-            if (e > s) out = out.substring(0, s) + out.substring(e);
-        }
-        return out;
-    }
-
-    /** 原生桥接脚本（xlsx 落盘 / 返回键） */
     private void injectBridgeScript(WebView view) {
         try {
             byte[] buf = readAsset("www/native-bridge.js");
@@ -337,38 +250,169 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** 供网页调用的原生能力 */
+    /** 网页可调用的本地数据 + 文件能力 */
     private final class NativeBridge {
+
         @JavascriptInterface
         public boolean isAvailable() {
             return true;
         }
 
-        /** 保存网页生成的 xlsx（base64）到「下载/记分板导出」 */
+        // ---------- 数据读写（全部本地） ----------
+
+        /** 读出全部成员与记录 */
         @JavascriptInterface
-        public void saveFile(final String fileName, final String mimeType, final String base64) {
-            final byte[] data;
+        public String loadAll() {
             try {
-                data = Base64.decode(base64, Base64.DEFAULT);
+                return store.loadAll().toString();
             } catch (Exception e) {
-                toastOnUi("导出失败：文件数据损坏");
-                return;
+                Log.e(TAG, "loadAll failed", e);
+                return "{\"members\":[]}";
             }
+        }
+
+        /** 整体覆盖（备份恢复/导入用） */
+        @JavascriptInterface
+        public boolean replaceAll(String json) {
+            try {
+                store.replaceAll(new JSONObject(json));
+                return true;
+            } catch (Exception e) {
+                Log.e(TAG, "replaceAll failed", e);
+                return false;
+            }
+        }
+
+        @JavascriptInterface
+        public boolean upsertMember(String id, String name) {
+            try {
+                store.upsertMember(id, name);
+                return true;
+            } catch (Exception e) {
+                Log.e(TAG, "upsertMember failed", e);
+                return false;
+            }
+        }
+
+        @JavascriptInterface
+        public boolean renameMember(String id, String name) {
+            try {
+                store.renameMember(id, name);
+                return true;
+            } catch (Exception e) {
+                return false;
+            }
+        }
+
+        @JavascriptInterface
+        public boolean deleteMember(String id) {
+            try {
+                store.deleteMember(id);
+                return true;
+            } catch (Exception e) {
+                return false;
+            }
+        }
+
+        /** 写一条记录：rec 为 JSON 字符串 */
+        @JavascriptInterface
+        public boolean putRecord(String memberId, String recJson) {
+            try {
+                store.putRecordForMember(memberId, new JSONObject(recJson));
+                return true;
+            } catch (Exception e) {
+                Log.e(TAG, "putRecord failed", e);
+                return false;
+            }
+        }
+
+        /** 软删除（撤回） */
+        @JavascriptInterface
+        public boolean softDeleteRecord(String recordId) {
+            try {
+                store.softDeleteRecord(recordId);
+                return true;
+            } catch (Exception e) {
+                return false;
+            }
+        }
+
+        // ---------- 管理员密码（本地） ----------
+
+        @JavascriptInterface
+        public boolean verifyPassword(String pwd) {
+            return pwd != null && pwd.equals(store.getPassword());
+        }
+
+        @JavascriptInterface
+        public boolean changePassword(String newPwd) {
+            if (newPwd == null || newPwd.trim().isEmpty()) return false;
+            store.setPassword(newPwd);
+            return true;
+        }
+
+        // ---------- 文件导出（分块，避免 Binder 1MB 限制） ----------
+
+        private ExportBuffer pending = null;
+
+        /** 开始一个导出文件 */
+        @JavascriptInterface
+        public synchronized boolean saveFileBegin(String fileName, String mimeType) {
+            try {
+                String safeName = sanitize(fileName == null || fileName.trim().isEmpty()
+                        ? "记分板导出.xlsx" : fileName.trim());
+                String mime = (mimeType == null || mimeType.trim().isEmpty())
+                        ? XLSX_MIME : mimeType;
+                pending = new ExportBuffer(safeName, mime);
+                return true;
+            } catch (Exception e) {
+                Log.e(TAG, "saveFileBegin failed", e);
+                pending = null;
+                return false;
+            }
+        }
+
+        /** 追加一块 base64 数据 */
+        @JavascriptInterface
+        public synchronized boolean saveFileChunk(String base64) {
+            if (pending == null) return false;
+            try {
+                pending.add(Base64.decode(base64, Base64.DEFAULT));
+                return true;
+            } catch (Exception e) {
+                Log.e(TAG, "saveFileChunk failed", e);
+                return false;
+            }
+        }
+
+        /** 结束并落盘 */
+        @JavascriptInterface
+        public synchronized boolean saveFileEnd() {
+            final ExportBuffer buf = pending;
+            pending = null;
+            if (buf == null) return false;
+            final byte[] data = buf.drain();
             runOnUiThread(new Runnable() {
                 @Override
                 public void run() {
                     try {
-                        String safeName = sanitize(fileName == null || fileName.trim().isEmpty()
-                                ? "记分板导出.xlsx" : fileName.trim());
-                        String mime = (mimeType == null || mimeType.trim().isEmpty())
-                                ? "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" : mimeType;
-                        saveToDownloads(safeName, mime, data);
+                        saveToDownloads(buf.getFileName(), buf.getMimeType(), data);
                         showSavedDialog();
                     } catch (Exception e) {
+                        Log.e(TAG, "saveFileEnd failed", e);
                         toastOnUi("导出失败：" + e.getMessage());
                     }
                 }
             });
+            return true;
+        }
+
+        /** 兼容旧调用：一次传完整文件 */
+        @JavascriptInterface
+        public void saveFile(final String fileName, final String mimeType, final String base64) {
+            if (!saveFileBegin(fileName, mimeType)) { toastOnUi("导出失败"); return; }
+            if (!saveFileChunk(base64)) { toastOnUi("导出失败：数据损坏"); return; }
+            saveFileEnd();
         }
 
         @JavascriptInterface
@@ -503,6 +547,7 @@ public class MainActivity extends Activity {
             webView.destroy();
             webView = null;
         }
+        if (store != null) store.close();
         super.onDestroy();
     }
 }

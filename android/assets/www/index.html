@@ -875,9 +875,6 @@ body.dark-mode .dialog-btn.primary{
 
 <script>
 // ========== 配置 ==========
-const SUPABASE_URL = 'https://jfbgv1.cn/sb';
-const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InN3bnV3Z3VxY3Zvc3lzY3VqbHl6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODczNzY4NjcsImV4cCI6MjEwMjk1Mjg2N30.D-KuxgtzQiCT9GfLoHQW4gZxTpjCZJct4FZiiRq_Mec';
-const EDGE_FUNCTION_URL = `${SUPABASE_URL}/functions/v1/admin_api`;
 const DEFAULT_PASSWORD = 'admin2024';
 const DEFAULT_MEMBERS = ['张新文','张至恒','詹子宁','赵鑫','刘子翔','刘昊琛','刘旭东','王家楠','赵子渊','袁孙豪','朱春炜','王元修'];
 const INIT_KEY = 'scoreboard_admin_initialized';
@@ -911,10 +908,17 @@ let auditLogs = [];
 let pendingUndo = null;
 let undoTimeout = null;
 let currentDetailMemberId = null;
-let isOnline = navigator.onLine;
+let isOnline = true;   // 本地模式：数据始终可用
 
-window.addEventListener('online', () => { isOnline = true; showToast('网络已恢复', 'success'); autoSync(); });
-window.addEventListener('offline', () => { isOnline = false; showToast('已离线，修改仅保存在本地', 'info'); });
+// 本地模式：不监听网络状态
+
+// ========== 全局错误兜底 ==========
+window.addEventListener('error', function (ev) {
+  console.error('页面脚本错误', ev.message, ev.filename + ':' + ev.lineno);
+});
+window.addEventListener('unhandledrejection', function (ev) {
+  console.warn('未处理的 Promise 拒绝', ev.reason && ev.reason.message);
+});
 
 // ========== 工具 ==========
 function showToast(message, type = 'info', duration = 2200) {
@@ -1011,43 +1015,50 @@ async function dialogAlert(m,t='提示'){return openDialog('alert',t,m);}
 async function dialogConfirm(m,t='确认操作',opts={}){return openDialog('confirm',t,m,opts);}
 async function dialogPrompt(m,t='请输入',opts={}){return openDialog('prompt',t,m,opts);}
 
-// ========== 后端调用 ==========
-async function restGet(path) {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
-    headers: {
-      'apikey': SUPABASE_ANON_KEY,
-      'Authorization': `Bearer ${SUPABASE_ANON_KEY}`
-    }
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
+// ========== 本地数据层（AndroidBridge → SQLite，无网络） ==========
+const hasNative = !!(window.AndroidBridge && window.AndroidBridge.isAvailable && window.AndroidBridge.isAvailable());
+
+function nativeCall(fn, args, fallback) {
+  if (!hasNative) return fallback;
+  try { return window.AndroidBridge[fn].apply(window.AndroidBridge, args || []); }
+  catch (e) { console.error("native " + fn + " failed", e); return fallback; }
 }
 
+/** 读取全部数据（替代原 restGet） */
+function loadAllLocal() {
+  const raw = nativeCall("loadAll", [], "{\"members\":[]}");
+  try { return JSON.parse(raw); } catch (e) { return { members: [] }; }
+}
+
+/** 兼容旧调用名：本地模式下不再有远端 */
+async function restGet(path) {
+  return loadAllLocal().members || [];
+}
+
+/** 兼容旧调用名：本地模式下这些动作走 SQLite */
 async function edgeCall(action, body = null, passwordOverride = null) {
-  const headers = {
-    'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-    'apikey': SUPABASE_ANON_KEY,
-    'Content-Type': 'application/json'
-  };
-  const pwd = passwordOverride !== null ? passwordOverride : currentPassword;
-  if (pwd) headers['x-admin-password'] = pwd;
-
-  const res = await fetch(`${EDGE_FUNCTION_URL}?action=${encodeURIComponent(action)}`, {
-    method: body ? 'POST' : 'GET',
-    headers,
-    body: body ? JSON.stringify(body) : null
-  });
-
-  const text = await res.text();
-  let json;
-  try { json = JSON.parse(text); } catch { json = { raw: text }; }
-
-  if (!res.ok) {
-    const err = new Error(json.error || `HTTP ${res.status}`);
-    err.status = res.status;
-    throw err;
+  if (action === "verify-password") {
+    const ok = nativeCall("verifyPassword", [String(passwordOverride || "")], false);
+    if (!ok) { const e = new Error("密码错误"); e.status = 401; throw e; }
+    return { ok: true };
   }
-  return json;
+  if (action === "change-password") {
+    const ok = nativeCall("changePassword", [String((body && body.newPassword) || "")], false);
+    if (!ok) { const e = new Error("密码无效"); e.status = 400; throw e; }
+    return { ok: true };
+  }
+  if (action === "delete-member") {
+    nativeCall("deleteMember", [String((body && body.id) || "")], false);
+    return { ok: true };
+  }
+  if (action === "add-log") {
+    // 本地模式：日志只存 localStorage，不再上云
+    return { ok: true };
+  }
+  if (action === "save-members") {
+    return { ok: true, data: (body && body.members) || [] };
+  }
+  return { ok: true };
 }
 
 // ========== 缓存 ==========
@@ -1068,105 +1079,74 @@ function loadCache() {
   return null;
 }
 
-// ========== 加载云端 ==========
+// ========== 本地加载 ==========
 async function loadFromCloud() {
   try {
-    const members = await restGet('members?select=*&order=id');
-    if (!Array.isArray(members) || members.length === 0) {
+    const root = loadAllLocal();
+    const members = root.members || [];
+    if (members.length === 0) {
       return { ok: false, empty: true };
     }
     data.members = members.map(m => {
       const recs = normalizeRecords(m.records);
-      const mm = {
-        id: m.id,
-        name: m.name,
-        totalScore: 0,
-        records: recs
-      };
+      const mm = { id: m.id, name: m.name, totalScore: 0, records: recs };
       mm.totalScore = recomputeTotal(mm);
       return mm;
     });
     saveCache();
     return { ok: true, empty: false };
   } catch (e) {
-    console.warn('加载成员失败', e);
-    return { ok: false, empty: false, reason: 'rest_fail', error: e };
+    console.warn('读取本地数据失败', e);
+    return { ok: false, empty: false, reason: 'local_fail', error: e };
   }
 }
 
-// ========== 上传云端（服务端已做合并） ==========
+// ========== 本地保存（写 SQLite） ==========
 async function saveToCloud() {
   const statusEl = document.getElementById('syncStatus');
 
   if (data.members.length === 0) {
-    if (statusEl) { statusEl.textContent = '⚠️ 无成员，已跳过同步'; statusEl.className = 'status-msg'; }
-    saveCache();
+    if (statusEl) { statusEl.textContent = '无成员'; statusEl.className = 'status-msg'; }
     return;
   }
 
-  if (!currentPassword) {
-    if (statusEl) { statusEl.textContent = '⚠️ 未登录，仅保存到本地'; statusEl.className = 'status-msg'; }
-    saveCache();
-    return;
-  }
-
-  if (statusEl) { statusEl.textContent = '⏳ 同步中...'; statusEl.className = 'status-msg'; }
+  if (statusEl) { statusEl.textContent = '保存中...'; statusEl.className = 'status-msg'; }
   try {
-    const payload = data.members.map(m => ({
-      id: m.id,
-      name: m.name,
-      total_score: Number(m.totalScore) || 0,
-      records: m.records
-    }));
-    const res = await edgeCall('save-members', { members: payload });
-
-    // 服务端返回合并后的最终数据，回写本地
-    if (res && Array.isArray(res.data)) {
-      data.members = res.data.map(m => {
-        const recs = normalizeRecords(m.records);
-        const mm = { id: m.id, name: m.name, totalScore: 0, records: recs };
-        mm.totalScore = recomputeTotal(mm);
-        return mm;
-      });
-      renderHome();
-      // ⭐ 如果详情页打开着，也刷新一下
-      if (!detailView.classList.contains('hidden')) {
-        renderDetail();
-      }
-    }
+    const payload = {
+      members: data.members.map(m => ({
+        id: m.id,
+        name: m.name,
+        records: m.records
+      }))
+    };
+    const ok = nativeCall('replaceAll', [JSON.stringify(payload)], false);
+    if (!ok && hasNative) throw new Error('写入失败');
     saveCache();
     if (statusEl) {
-      statusEl.textContent = '✅ 已同步';
+      statusEl.textContent = '已保存';
       statusEl.className = 'status-msg success';
-      setTimeout(() => { statusEl.textContent = ''; statusEl.className = 'status-msg'; }, 2200);
+      setTimeout(() => { statusEl.textContent = ''; statusEl.className = 'status-msg'; }, 1800);
     }
   } catch (e) {
     if (statusEl) {
-      statusEl.textContent = '❌ 同步失败：' + (e.status === 401 ? '密码失效，请重新登录管理页' : e.message);
+      statusEl.textContent = '保存失败：' + e.message;
       statusEl.className = 'status-msg error';
-    }
-    if (e.status === 401) {
-      adminAuthenticated = false;
-      currentPassword = null;
     }
     throw e;
   }
 }
 
 async function uploadPassword(newPwd) {
-  await edgeCall('change-password', { newPassword: newPwd });
+  const ok = nativeCall('changePassword', [String(newPwd)], false);
+  if (!ok) throw new Error('密码保存失败');
 }
 
 let syncTimer;
 function autoSync() {
   clearTimeout(syncTimer);
   syncTimer = setTimeout(() => {
-    if (isOnline) {
-      saveToCloud().catch(e => console.warn('自动同步失败', e));
-    } else {
-      saveCache();
-    }
-  }, 800);
+    saveToCloud().catch(e => console.warn('本地保存失败', e));
+  }, 400);
 }
 
 // ========== 视图切换 ==========
@@ -1457,19 +1437,10 @@ function startGroup() {
 }
 
 // ========== 日志/备份/导出 ==========
-async function sendCloudLog(action, target, detail) {
-  if (!isOnline || !currentPassword) return;
-  try {
-    await edgeCall('add-log', { action, target, detail, timestamp: new Date().toISOString() });
-  } catch (e) {
-    console.warn('云端日志记录失败', e);
-  }
-}
 function addLog(action, target, detail) {
   auditLogs.push({ id: Date.now(), time: new Date().toISOString(), action, target, detail });
   if(auditLogs.length > 500) auditLogs = auditLogs.slice(-500);
   try { localStorage.setItem('scoreboard_admin_logs', JSON.stringify(auditLogs)); } catch(e){}
-  sendCloudLog(action, target, detail);
 }
 function backupData() {
   try { localStorage.setItem('scoreboard_admin_backup', JSON.stringify(data)); showToast('备份已保存到本地','success'); }
@@ -1478,7 +1449,7 @@ function backupData() {
 async function restoreBackup() {
   const backup = localStorage.getItem('scoreboard_admin_backup');
   if (!backup) { showToast('没有备份', 'error'); return; }
-  if (!await dialogConfirm('从本地备份恢复？当前本地数据将被覆盖！<br><b>不会自动上传云端</b>，请确认后再手动同步。', '恢复备份', { danger: true })) return;
+  if (!await dialogConfirm('从本地备份恢复？当前本地数据将被覆盖！', '恢复备份', { danger: true })) return;
   try {
     const parsed = JSON.parse(backup);
     if (!parsed || !Array.isArray(parsed.members)) { showToast('备份数据无效', 'error'); return; }
@@ -1487,7 +1458,8 @@ async function restoreBackup() {
     if (!detailView.classList.contains('hidden')) renderDetail();
     if (!adminView.classList.contains('hidden')) renderAdmin(false);
     if (!drawView.classList.contains('hidden')) renderDrawView();
-    showToast('已恢复本地（未上传）','success');
+    autoSync();   // 本地模式：立即写入 SQLite
+    showToast('已恢复到本地数据库','success');
   } catch (e) { showToast('恢复失败：' + e.message, 'error'); }
 }
 function setUndo(desc, fn) {
@@ -1515,7 +1487,7 @@ function sanitizeSheetName(name, usedNames){
 }
 
 function exportCSV() {
-  if(!window.XLSX){ showToast('SheetJS 未加载，请联网重试','error'); return; }
+  if(!window.XLSX){ showToast('导出模块未加载，请重启 App','error'); return; }
   const sorted = [...data.members].sort((a,b)=>(b.totalScore||0)-(a.totalScore||0));
   const rows = [['排名','成员','总分','记录数']];
   sorted.forEach((m,i)=>rows.push([i+1, m.name, m.totalScore??0, visibleRecords(m).length]));
@@ -1529,7 +1501,7 @@ function exportCSV() {
 }
 
 function exportDetailCSV() {
-  if(!window.XLSX){ showToast('SheetJS 未加载，请联网重试','error'); return; }
+  if(!window.XLSX){ showToast('导出模块未加载，请重启 App','error'); return; }
   const m = data.members.find(m=>m.id===currentDetailMemberId);
   if(!m) return showToast('请先选择一个成员','error');
   const rows = [['时间','类别','变化','原因','操作者']];
@@ -1560,7 +1532,7 @@ function exportDetailCSV() {
 }
 
 function exportAllCSV() {
-  if(!window.XLSX){ showToast('SheetJS 未加载，请联网重试','error'); return; }
+  if(!window.XLSX){ showToast('导出模块未加载，请重启 App','error'); return; }
   if(!data.members.length){ showToast('暂无数据','error'); return; }
 
   const wb = XLSX.utils.book_new();
@@ -1743,33 +1715,19 @@ document.getElementById('addMemberBtn').addEventListener('click', async ()=>{
   showToast(`已添加 ${name.trim()}`,'success');
 });
 
-async function deleteMemberFromCloud(memberId) {
-  await edgeCall('delete-member', { id: memberId });
-}
 document.getElementById('deleteMemberBtn').addEventListener('click', async ()=>{
   if(selectedIds.size===0){await dialogAlert('请选择要删除的成员'); return;}
   const names = Array.from(selectedIds).map(id => esc(data.members.find(m=>m.id===id)?.name || '')).join('、');
-  if(!await dialogConfirm(`永久删除：${names}？`,'删除',{danger:true})) return;
-  const failed = [];
+  if(!await dialogConfirm(`永久删除：${names}？`, '删除', {danger:true})) return;
+
   const toDelete = Array.from(selectedIds);
-  for(const id of toDelete) {
-    try {
-      await deleteMemberFromCloud(id);
-      data.members = data.members.filter(m => m.id !== id);
-    } catch(e) {
-      console.error('删除云端成员失败', e);
-      failed.push(data.members.find(m=>m.id===id)?.name || id);
-    }
-  }
-  selectedIds.clear(); renderAdmin(false); renderHome();
-  if(failed.length === 0) {
-    autoSync();
-    addLog('删除成员', names, '');
-    showToast('已删除（含云端）','info');
-  } else {
-    addLog('删除成员', names, `失败：${failed.join('、')}`);
-    showToast(`部分删除失败：${failed.join('、')}`,'error');
-  }
+  data.members = data.members.filter(m => !toDelete.includes(m.id));
+  selectedIds.clear();
+  renderAdmin(false);
+  renderHome();
+  autoSync();                       // 立即重写本地 SQLite
+  addLog('删除成员', names, '');
+  showToast('已删除', 'success');
 });
 
 document.getElementById('logBtn').addEventListener('click', ()=>{
@@ -1792,17 +1750,17 @@ document.getElementById('backupBtn').addEventListener('click', ()=>{vibrate(6); 
 document.getElementById('restoreBtn').addEventListener('click', ()=>{vibrate(6); restoreBackup();});
 document.getElementById('refreshBtn').addEventListener('click', async ()=>{
   vibrate(8);
-  showToast('正在同步...','info');
+  showToast('正在刷新...','info');
   const res = await loadFromCloud();
   if(res.ok) {
     renderHome();
     if(!detailView.classList.contains('hidden')) renderDetail();
     if(!drawView.classList.contains('hidden')) renderDrawView();
-    showToast('同步成功','success');
+    showToast('已是最新数据','success');
   } else if(res.empty) {
-    showToast('云端无数据','info');
+    showToast('本地暂无数据','info');
   } else {
-    showToast('同步失败','error');
+    showToast('读取失败','error');
   }
 });
 
@@ -1892,53 +1850,34 @@ function initUI() {
 (async function init() {
   try { auditLogs = JSON.parse(localStorage.getItem('scoreboard_admin_logs')||'[]'); } catch(e){ auditLogs = []; }
 
-  const cached = loadCache();
-  if(cached && cached.members && cached.members.length > 0) {
-    data = cached;
-    // 用未删除记录重算总分
-    data.members.forEach(m => { m.totalScore = recomputeTotal(m); });
-    initUI();
-    if(isOnline) {
-      loadFromCloud().then(res => {
-        if(res.ok) {
-          renderHome();
-          if(!detailView.classList.contains('hidden')) renderDetail();
-          if(!drawView.classList.contains('hidden')) renderDrawView();
-        }
-      }).catch(e => console.warn('后台同步失败', e));
-    }
-    return;
-  }
-
-  showLoading('加载云端数据...','loading');
+  showLoading('加载本地数据...','loading');
   const res = await loadFromCloud();
 
-  if(res.ok) {
-    // 云端有数据
-  } else if(res.empty) {
-    const initialized = (() => { try { return localStorage.getItem(INIT_KEY) === '1'; } catch(e){ return false; } })();
-    if(!initialized) {
-      data.members = DEFAULT_MEMBERS.map((name, i) => ({
-        id: 'u' + (i + 1), name, totalScore: 0, records: []
-      }));
-      try { localStorage.setItem(INIT_KEY, '1'); } catch(e){}
-    } else {
-      data.members = [];
-    }
-  } else {
-    showToast('加载云端失败，使用本地默认（未上传）','error');
+  if (!res.ok && res.empty) {
+    // 数据库为空（极少数情况：种子未灌入）。用默认名单兜底。
     data.members = DEFAULT_MEMBERS.map((name, i) => ({
       id: 'u' + (i + 1), name, totalScore: 0, records: []
     }));
+    showToast('本地暂无数据，已载入默认成员', 'info');
+  } else if (!res.ok) {
+    showToast('读取本地数据失败，请重启 App', 'error');
+    data.members = [];
   }
 
   initUI();
 
+  // 每次都监听窗口尺寸（原版只在无缓存分支注册，是有 bug 的）
   let navResizeTimer = null;
-  window.addEventListener('resize', ()=>{
+  window.addEventListener('resize', () => {
     clearTimeout(navResizeTimer);
-    navResizeTimer = setTimeout(()=>{ const active = document.querySelector('.nav-btn.active'); updateNavSlider(active, false); }, 80);
+    navResizeTimer = setTimeout(() => {
+      const active = document.querySelector('.nav-btn.active');
+      updateNavSlider(active, false);
+    }, 80);
   });
+
+  // 启动时同步一次到 SQLite，保证种子数据落库
+  if (data.members.length) autoSync();
 })();
 
 

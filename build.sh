@@ -17,7 +17,7 @@ aapt package -f -M "$ANDROID/AndroidManifest.xml" -S "$ANDROID/res" -A "$ANDROID
 
 echo "[2/6] 编译 Java (javac)"
 javac -source 8 -target 8 -encoding UTF-8 -bootclasspath "$AJAR" -d "$BUILD/classes" \
-  "$ANDROID/src/com/jfbg/scoreboard/MainActivity.java" 2>&1 | grep -vE "^Note:|warning: \[options\]" || true
+  "$ANDROID"/src/com/jfbg/scoreboard/*.java 2>&1 | grep -vE "^Note:|warning: \[options\]" || true
 
 echo "[3/6] 转换 dex (d8)"
 java -cp "$D8" com.android.tools.r8.D8 --release --min-api 24 --lib "$AJAR" \
@@ -33,7 +33,7 @@ zipalign -f 4 "$BUILD/app-with-dex.apk" "$BUILD/app-aligned.apk"
 echo "[6/6] 签名 (apksigner)"
 apksigner sign --ks "$BUILD/keystore.jks" --ks-key-alias scoreboard \
   --ks-pass pass:scoreboard2024 --key-pass pass:scoreboard2024 \
-  --out "$BUILD/记分板-v1.0.0.apk" "$BUILD/app-aligned.apk"
+  --out "$BUILD/记分板-v2.0.0-离线版.apk" "$BUILD/app-aligned.apk"
 
-apksigner verify "$BUILD/记分板-v1.0.0.apk" && echo "签名校验通过"
-ls -lh "$BUILD/记分板-v1.0.0.apk"
+apksigner verify "$BUILD/记分板-v2.0.0-离线版.apk" && echo "签名校验通过"
+ls -lh "$BUILD/记分板-v2.0.0-离线版.apk"
