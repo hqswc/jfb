@@ -9,7 +9,18 @@ AJAR="$HOME/android.jar"
 D8="$PREFIX/extensions/android-buildtools/share/java/d8.jar"
 
 rm -rf "$BUILD/classes" "$BUILD/dex"
-mkdir -p "$BUILD/classes" "$BUILD/dex"
+mkdir -p "$BUILD/classes" "$BUILD/dex" "$ANDROID/assets/seed"
+
+# 种子数据以 seed/ 为唯一来源，构建时同步进 assets（否则改 seed 不生效）
+echo "[0/6] 同步种子数据"
+cp "$ROOT/seed/initial-data.json" "$ANDROID/assets/seed/initial-data.json"
+node -e '
+const j=require(process.argv[1]);
+const ids=[]; j.members.forEach(m=>(m.records||[]).forEach(r=>ids.push(String(r.id))));
+const dup=ids.length-new Set(ids).size;
+console.log("  members="+j.members.length+" records="+ids.length+" 重复id="+dup);
+if(dup>0){console.error("  ERROR: seed 存在重复记录 id，初始化会丢记录");process.exit(1);}
+' "$ANDROID/assets/seed/initial-data.json"
 
 echo "[1/6] 打包资源 (aapt)"
 aapt package -f -M "$ANDROID/AndroidManifest.xml" -S "$ANDROID/res" -A "$ANDROID/assets" \
